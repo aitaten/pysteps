@@ -66,8 +66,27 @@ try:
 except ImportError:
     DASK_IMPORTED = False
 
+try:
+    import dask.array as da
+
+    DASK_ARRAY_IMPORTED = True
+except ImportError:
+    da = None
+    DASK_ARRAY_IMPORTED = False
+
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
+
+
+class CascadeProvider(Protocol):
+    """Protocol for lightweight lazy providers returning cascade dictionaries."""
+
+    def __getitem__(self, key: Any) -> Any: ...
+
+    def __call__(self, model_idx: int, timestep: int) -> Any: ...
+
+
+DaskArrayType = da.Array if DASK_ARRAY_IMPORTED else Any
 
 
 @dataclass(frozen=True)
@@ -374,7 +393,7 @@ class StepsBlendingState:
     precip_extrapolated_probability_matching: np.ndarray | None = None
 
     # NWP model states
-    precip_models_cascades: np.ndarray | None = None
+    precip_models_cascades: np.ndarray | CascadeProvider | None = None
     precip_models_cascades_timestep: np.ndarray | None = None
     precip_models_timestep: np.ndarray | None = None
     mean_models_timestep: np.ndarray | None = None
@@ -427,7 +446,7 @@ class StepsBlendingNowcaster:
         self,
         precip,
         precip_nowcast,
-        precip_models,
+        precip_models: np.ndarray | DaskArrayType | CascadeProvider,
         velocity,
         velocity_models,
         time_steps,
@@ -450,6 +469,13 @@ class StepsBlendingNowcaster:
         self.__params = StepsBlendingParams()
         self.__state = StepsBlendingState()
 
+        # Internal bookkeeping for lazy precip_models handling
+        self.__precip_models_ndim = None
+        self.__precip_models_is_dask_array = False
+        self.__precip_models_lazy_cascade_provider: CascadeProvider | None = None
+        self.__n_models: int | None = None
+        self.__n_timesteps: int | None = None
+
         # Additional variables for time measurement
         self.__start_time_init = None
         self.__init_time = None
@@ -466,15 +492,19 @@ class StepsBlendingNowcaster:
           Array of shape (ar_order+1,m,n) containing the input precipitation fields
           ordered by timestamp from oldest to newest. The time steps between the
           inputs are assumed to be regular.
-        precip_models: array-like
+        precip_models: array-like, dask.array.Array or callable/mapping
           Either raw (NWP) model forecast data or decomposed (NWP) model forecast data.
-          If you supply decomposed data, it needs to be an array of shape
+          If you supply decomposed data, it needs to be an array (or list-like) of shape
           (n_models,timesteps+1) containing, per timestep (t=0 to lead time here) and
           per (NWP) model or model ensemble member, a dictionary with a list of cascades
           obtained by calling a method implemented in :py:mod:`pysteps.cascade.decomposition`.
-          If you supply the original (NWP) model forecast data, it needs to be an array of shape
-          (n_models,timestep+1,m,n) containing precipitation (or other) fields, which will
-          then be decomposed in this function.
+          A lightweight lazy provider (callable or mapping with ``__getitem__``) that returns
+          the cascade dictionary for a specific (model, timestep) is also supported to avoid
+          loading all cascades at once.
+
+          If you supply the original (NWP) model forecast data, it can be a NumPy array
+          or :class:`dask.array.Array` of shape (n_models,timestep+1,m,n) containing
+          precipitation (or other) fields, which will then be decomposed in this function.
 
           Depending on your use case it can be advantageous to decompose the model
           forecasts outside beforehand, as this slightly reduces calculation times.
@@ -758,11 +788,8 @@ class StepsBlendingNowcaster:
                 f"Spatial dimensions of precip and velocity do not match: "
                 f"{self.__precip.shape[1:3]} vs {self.__velocity.shape[1:3]}"
             )
-        # Check if the number of members in the precipitation models and velocity models match
-        if self.__precip_models.shape[0] != self.__velocity_models.shape[0]:
-            raise ValueError(
-                "The number of members in the precipitation models and velocity models must match"
-            )
+
+        self.__n_models = self.__velocity_models.shape[0]
 
         if isinstance(self.__timesteps, list):
             self.__params.time_steps_is_list = True
@@ -770,38 +797,56 @@ class StepsBlendingNowcaster:
                 raise ValueError(
                     "timesteps is not in ascending order", self.__timesteps
                 )
-            if self.__precip_models.shape[1] != math.ceil(self.__timesteps[-1]) + 1:
-                raise ValueError(
-                    "precip_models does not contain sufficient lead times for this forecast"
-                )
+            expected_timesteps = math.ceil(self.__timesteps[-1]) + 1
             self.__params.original_timesteps = [0] + list(self.__timesteps)
             self.__timesteps = nowcast_utils.binned_timesteps(
                 self.__params.original_timesteps
             )
         else:
             self.__params.time_steps_is_list = False
-            if self.__precip_models.shape[1] != self.__timesteps + 1:
-                raise ValueError(
-                    "precip_models does not contain sufficient lead times for this forecast"
-                )
+            expected_timesteps = self.__timesteps + 1
             self.__timesteps = list(range(self.__timesteps + 1))
 
-        precip_nwp_dim = self.__precip_models.ndim
-        if precip_nwp_dim == 2:
+        self.__n_timesteps = expected_timesteps
+
+        self.__precip_models_is_dask_array = bool(
+            DASK_ARRAY_IMPORTED and isinstance(self.__precip_models, da.Array)
+        )
+        precip_nwp_dim = getattr(self.__precip_models, "ndim", None)
+        if precip_nwp_dim is None:
+            # Treat precip_models as a lazy provider of cascade dictionaries
+            self.__params.precip_models_provided_is_cascade = True
+            self.__precip_models_ndim = 2
+            self.__precip_models_lazy_cascade_provider = self.__precip_models
+            self.__validate_cascade_provider(self.__n_models, self.__n_timesteps)
+        elif precip_nwp_dim == 2:
             if isinstance(self.__precip_models[0][0], dict):
                 # It's a 2D array of dictionaries with decomposed cascades
                 self.__params.precip_models_provided_is_cascade = True
+                self.__precip_models_ndim = 2
             else:
                 raise ValueError(
                     "When precip_models has ndim == 2, it must contain dictionaries with decomposed cascades."
                 )
         elif precip_nwp_dim == 4:
             self.__params.precip_models_provided_is_cascade = False
+            self.__precip_models_ndim = 4
         else:
             raise ValueError(
                 "precip_models must be either a two-dimensional array containing dictionaries with decomposed model fields"
                 "or a four-dimensional array containing the original (NWP) model forecasts"
             )
+
+        if precip_nwp_dim is not None:
+            if self.__precip_models.shape[0] != self.__n_models:
+                raise ValueError(
+                    "The number of members in the precipitation models and velocity models must match"
+                )
+            if self.__precip_models.shape[1] != self.__n_timesteps:
+                raise ValueError(
+                    "precip_models does not contain sufficient lead times for this forecast"
+                )
+
         if self.__precip_nowcast is not None:
             precip_nowcast_dim = self.__precip_nowcast.ndim
             if precip_nowcast_dim != 4:
@@ -834,9 +879,7 @@ class StepsBlendingNowcaster:
 
         if self.__config.climatology_kwargs is None:
             # Make sure clim_kwargs at least contains the number of models
-            self.__params.climatology_kwargs = dict(
-                {"n_models": self.__precip_models.shape[0]}
-            )
+            self.__params.climatology_kwargs = dict({"n_models": self.__n_models})
         else:
             self.__params.climatology_kwargs = deepcopy(
                 self.__config.climatology_kwargs
@@ -915,10 +958,10 @@ class StepsBlendingNowcaster:
 
         print("NWP and blending inputs")
         print("-----------------------")
-        print(f"number of (NWP) models:      {self.__precip_models.shape[0]}")
+        print(f"number of (NWP) models:      {self.__n_models}")
         print(f"blend (NWP) model members:   {self.__config.blend_nwp_members}")
         print(
-            f"decompose (NWP) models:      {'yes' if self.__precip_models.ndim == 4 else 'no'}"
+            f"decompose (NWP) models:      {'yes' if self.__precip_models_ndim == 4 else 'no'}"
         )
         print("")
 
@@ -1157,18 +1200,19 @@ class StepsBlendingNowcaster:
         if self.__params.precip_models_provided_is_cascade:
             self.__state.precip_models_cascades = self.__precip_models
             # Inline logic of _compute_cascade_recomposition_nwp
-            temp_precip_models = []
-            for i in range(self.__precip_models.shape[0]):
-                precip_model = []
-                for time_step in range(self.__precip_models.shape[1]):
-                    # Use the recomposition method to rebuild the rainfall fields
-                    recomposed = self.__params.recomposition_method(
-                        self.__precip_models[i, time_step]
-                    )
-                    precip_model.append(recomposed)
-                temp_precip_models.append(precip_model)
+            if self.__precip_models_lazy_cascade_provider is None:
+                temp_precip_models = []
+                for i in range(self.__n_models):
+                    precip_model = []
+                    for time_step in range(self.__n_timesteps):
+                        # Use the recomposition method to rebuild the rainfall fields
+                        recomposed = self.__params.recomposition_method(
+                            self.__precip_models[i, time_step]
+                        )
+                        precip_model.append(recomposed)
+                    temp_precip_models.append(precip_model)
 
-            self.__precip_models = np.stack(temp_precip_models)
+                self.__precip_models = np.stack(temp_precip_models)
 
         # Check for zero input fields in the radar, nowcast and NWP data.
         self.__params.zero_precip_radar = check_norain(
@@ -1180,12 +1224,7 @@ class StepsBlendingNowcaster:
 
         # The norain fraction threshold used for nwp is the default value of 0.0,
         # since nwp does not suffer from clutter.
-        self.__params.zero_precip_model_fields = check_norain(
-            self.__precip_models,
-            self.__params.precip_threshold,
-            self.__config.norain_threshold,
-            self.__params.noise_kwargs["win_fun"],
-        )
+        self.__params.zero_precip_model_fields = self.__check_norain_precip_models()
 
     def __decompose_member(self, member_field):
         """Loop over timesteps for a single ensemble member."""
@@ -1296,23 +1335,22 @@ class StepsBlendingNowcaster:
         # rainfall data
         # Initialize noise based on the NWP field time step where the fraction of rainy cells is highest
         if self.__params.precip_threshold is None:
-            self.__params.precip_threshold = np.nanmin(self.__precip_models)
+            self.__params.precip_threshold = self.__compute_precip_models_min()
 
         max_rain_pixels = -1
         max_rain_pixels_j = -1
         max_rain_pixels_t = -1
-        for j in range(self.__precip_models.shape[0]):
+        for j in range(self.__n_models):
             for t in self.__timesteps:
-                rain_pixels = self.__precip_models[j][t][
-                    self.__precip_models[j][t] > self.__params.precip_threshold
-                ].size
+                precip_model = self.__get_precip_model_field(j, t)
+                rain_pixels = precip_model[precip_model > self.__params.precip_threshold].size
                 if rain_pixels > max_rain_pixels:
                     max_rain_pixels = rain_pixels
                     max_rain_pixels_j = j
                     max_rain_pixels_t = t
-        self.__state.precip_noise_input = self.__precip_models[max_rain_pixels_j][
-            max_rain_pixels_t
-        ]
+        self.__state.precip_noise_input = self.__get_precip_model_field(
+            max_rain_pixels_j, max_rain_pixels_t
+        )
         self.__state.precip_noise_input = self.__state.precip_noise_input.astype(
             np.float64, copy=False
         )
@@ -1320,16 +1358,24 @@ class StepsBlendingNowcaster:
         # If zero_precip_radar, make sure that precip_cascade does not contain
         # only nans or infs. If so, fill it with the zero value.
         if self.__state.precip_models_cascades is not None:
-            self.__state.precip_cascades[~np.isfinite(self.__state.precip_cascades)] = (
-                np.nanmin(
-                    self.__state.precip_models_cascades[
-                        max_rain_pixels_j, max_rain_pixels_t
-                    ]["cascade_levels"]
+            if self.__precip_models_lazy_cascade_provider is not None:
+                cascade_dict = self.__access_cascade_provider(
+                    self.__precip_models_lazy_cascade_provider,
+                    max_rain_pixels_j,
+                    max_rain_pixels_t,
                 )
+            else:
+                cascade_dict = self.__state.precip_models_cascades[
+                    max_rain_pixels_j, max_rain_pixels_t
+                ]
+            self.__state.precip_cascades[~np.isfinite(self.__state.precip_cascades)] = (
+                np.nanmin(cascade_dict["cascade_levels"])
             )
         else:
             precip_models_cascade_timestep = self.__params.decomposition_method(
-                self.__precip_models[max_rain_pixels_j, max_rain_pixels_t, :, :],
+                self.__get_precip_model_field(
+                    max_rain_pixels_j, max_rain_pixels_t
+                ),
                 bp_filter=self.__params.bandpass_filter,
                 fft_method=self.__params.fft,
                 output_domain=self.__config.domain,
@@ -1686,14 +1732,14 @@ class StepsBlendingNowcaster:
         Decompose NWP model precipitation fields if needed, store cascade components,
         and replace any NaN or infinite values with appropriate minimum values.
         """
-        if self.__state.precip_models_cascades is not None:
-            decomp_precip_models = list(self.__state.precip_models_cascades[:, t])
-
+        precip_models_timestep = self.__get_precip_models_at_timestep(t)
+        if self.__params.precip_models_provided_is_cascade:
+            decomp_precip_models = self.__get_cascades_for_timestep(t)
         else:
-            if self.__precip_models.shape[0] == 1:
+            if precip_models_timestep.shape[0] == 1:
                 decomp_precip_models = [
                     self.__params.decomposition_method(
-                        self.__precip_models[0, t, :, :],
+                        precip_models_timestep[0, :, :],
                         bp_filter=self.__params.bandpass_filter,
                         fft_method=self.__params.fft,
                         output_domain=self.__config.domain,
@@ -1714,7 +1760,7 @@ class StepsBlendingNowcaster:
                             compute_stats=True,
                             compact_output=True,
                         ),
-                        list(self.__precip_models[:, t, :, :]),
+                        list(precip_models_timestep),
                     )
 
         self.__state.precip_models_cascades_timestep = np.array(
@@ -1733,7 +1779,7 @@ class StepsBlendingNowcaster:
 
         # Ensure that the NWP cascade and fields do no contain any nans or infinite number
         # Fill nans and infinite numbers with the minimum value present in precip
-        self.__state.precip_models_timestep = self.__precip_models[:, t, :, :].astype(
+        self.__state.precip_models_timestep = precip_models_timestep.astype(
             np.float64, copy=False
         )  # (corresponding to zero rainfall in the radar observations)
         min_cascade = np.nanmin(self.__state.precip_cascades)
@@ -3197,6 +3243,172 @@ class StepsBlendingNowcaster:
             worker_state.final_blended_forecast_recomposed
         )
         return final_blended_forecast_single_member
+
+    def __access_cascade_provider(self, provider, model_idx, timestep):
+        """Retrieve a cascade dictionary from a provider."""
+        if callable(provider):
+            return provider(model_idx, timestep)
+        try:
+            return provider[model_idx, timestep]
+        except Exception:
+            pass
+        try:
+            item = provider[model_idx]
+            if callable(item):
+                return item(timestep)
+            return item[timestep]
+        except Exception as exc:
+            raise ValueError(
+                "Unable to retrieve cascade dictionary "
+                f"for model {model_idx}, timestep {timestep} from precip_models"
+            ) from exc
+
+    def __validate_cascade_provider(self, n_models, n_timesteps):
+        """Ensure a lazy cascade provider can supply the required entries."""
+        if self.__precip_models_lazy_cascade_provider is None:
+            return
+        if n_models is None or n_timesteps is None:
+            raise ValueError("n_models and n_timesteps must be set for validation.")
+        if hasattr(self.__precip_models_lazy_cascade_provider, "__len__"):
+            if len(self.__precip_models_lazy_cascade_provider) != n_models:
+                raise ValueError(
+                    "precip_models cascade provider length does not match velocity_models"
+                )
+        _ = self.__access_cascade_provider(
+            self.__precip_models_lazy_cascade_provider, 0, 0
+        )
+        last_model = max(n_models - 1, 0)
+        last_timestep = max(n_timesteps - 1, 0)
+        _ = self.__access_cascade_provider(
+            self.__precip_models_lazy_cascade_provider, last_model, last_timestep
+        )
+
+    def __get_cascades_for_timestep(self, timestep):
+        """Return cascade dictionaries for all models at a given timestep."""
+        if (
+            self.__params.precip_models_provided_is_cascade
+            and self.__precip_models_lazy_cascade_provider is not None
+        ):
+            return [
+                self.__access_cascade_provider(
+                    self.__precip_models_lazy_cascade_provider, model_idx, timestep
+                )
+                for model_idx in range(self.__n_models)
+            ]
+        if self.__params.precip_models_provided_is_cascade:
+            return list(self.__state.precip_models_cascades[:, timestep])
+        return []
+
+    def __get_precip_models_at_timestep(self, timestep):
+        """Return recomposed precip model fields for a timestep."""
+        if self.__params.precip_models_provided_is_cascade:
+            if (
+                self.__precip_models_lazy_cascade_provider is None
+                and hasattr(self.__precip_models, "ndim")
+                and getattr(self.__precip_models, "ndim", 0) == 4
+            ):
+                precip_models_timestep = self.__precip_models[:, timestep, :, :]
+                return np.asarray(precip_models_timestep, dtype=np.float64)
+
+            cascades = self.__get_cascades_for_timestep(timestep)
+            recomposed = [
+                self.__params.recomposition_method(cascade_dict)
+                for cascade_dict in cascades
+            ]
+            return np.stack(recomposed).astype(np.float64, copy=False)
+
+        precip_slice = self.__precip_models[:, timestep, :, :]
+        if self.__precip_models_is_dask_array:
+            precip_slice = precip_slice.astype(np.float64)
+            precip_slice = precip_slice.compute()
+        return np.asarray(precip_slice, dtype=np.float64)
+
+    def __get_precip_model_field(self, model_idx, timestep):
+        """Return a single recomposed precip model field."""
+        return self.__get_precip_models_at_timestep(timestep)[model_idx]
+
+    def __compute_precip_models_min(self):
+        """Compute the minimum precip value across all model fields."""
+        if self.__params.precip_models_provided_is_cascade:
+            mins = []
+            for t in range(self.__n_timesteps):
+                mins.append(np.nanmin(self.__get_precip_models_at_timestep(t)))
+            return float(np.nanmin(mins))
+        if self.__precip_models_is_dask_array:
+            return float(self.__precip_models.min().compute())
+        return float(np.nanmin(self.__precip_models))
+
+    def __check_norain_precip_models(self):
+        """Check for no-rain condition in precip_models, supporting dask and lazy providers."""
+        if self.__precip_models_is_dask_array:
+            return self.__check_norain_precip_models_dask()
+        if (
+            self.__params.precip_models_provided_is_cascade
+            and self.__precip_models_lazy_cascade_provider is not None
+        ):
+            return self.__check_norain_precip_models_cascade_provider()
+        return check_norain(
+            self.__precip_models,
+            self.__params.precip_threshold,
+            self.__config.norain_threshold,
+            self.__params.noise_kwargs["win_fun"],
+        )
+
+    def __check_norain_precip_models_dask(self):
+        """Dask-aware norain check to avoid pulling the full array into memory."""
+        win_fun = self.__params.noise_kwargs["win_fun"]
+        precip_arr = self.__precip_models
+        precip_min = precip_arr.min()
+        if win_fun is not None:
+            tapering = utils.tapering.compute_window_function(
+                precip_arr.shape[-2], precip_arr.shape[-1], win_fun
+            )
+            tapering_mask = tapering == 0.0
+            masked_precip = da.where(tapering_mask, precip_min, precip_arr)
+        else:
+            masked_precip = precip_arr
+
+        precip_thr = (
+            self.__params.precip_threshold
+            if self.__params.precip_threshold is not None
+            else masked_precip.min()
+        )
+        rain_pixels = da.sum(masked_precip > precip_thr)
+        rain_fraction = float(rain_pixels.compute()) / masked_precip.size
+        print(
+            f"Rain fraction is: {rain_fraction}, while minimum fraction is {self.__config.norain_threshold}"
+        )
+        return rain_fraction <= self.__config.norain_threshold
+
+    def __check_norain_precip_models_cascade_provider(self):
+        """Norain check for lazy cascade providers without stacking all timesteps."""
+        win_fun = self.__params.noise_kwargs["win_fun"]
+        precip_min = self.__compute_precip_models_min()
+        precip_thr = (
+            self.__params.precip_threshold
+            if self.__params.precip_threshold is not None
+            else precip_min
+        )
+        if win_fun is not None:
+            tapering = utils.tapering.compute_window_function(
+                self.__velocity.shape[1], self.__velocity.shape[2], win_fun
+            )
+        else:
+            tapering = np.ones((self.__velocity.shape[1], self.__velocity.shape[2]))
+        tapering_mask = tapering == 0.0
+        rainy_pixels = 0
+        total_pixels = self.__n_models * self.__n_timesteps * tapering.size
+        for t in range(self.__n_timesteps):
+            precip_models_timestep = self.__get_precip_models_at_timestep(t)
+            precip_models_timestep[..., tapering_mask] = precip_min
+            rainy_pixels += np.count_nonzero(
+                precip_models_timestep > precip_thr
+            )
+        rain_fraction = rainy_pixels / total_pixels
+        print(
+            f"Rain fraction is: {rain_fraction}, while minimum fraction is {self.__config.norain_threshold}"
+        )
+        return rain_fraction <= self.__config.norain_threshold
 
     def __measure_time(self, label, start_time):
         """
