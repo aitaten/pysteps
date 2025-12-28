@@ -2,11 +2,27 @@
 
 import datetime
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
+try:
+    import jsmin  # type: ignore
+except ImportError:  # pragma: no cover - test shim
+    jsmin_module = types.ModuleType("jsmin")
+    jsmin_module.jsmin = lambda x: x
+    sys.modules["jsmin"] = jsmin_module
+
+proesmans_stub = types.ModuleType("pysteps.motion._proesmans")
+proesmans_stub._compute_advection_field = (
+    lambda *args, **kwargs: (_ for _ in ()).throw(ImportError("stubbed _proesmans"))
+)
+sys.modules["pysteps.motion._proesmans"] = proesmans_stub
+
 import pysteps
-from pysteps import blending, cascade
+from pysteps import blending, cascade, utils
 
 # fmt:off
 steps_arg_values = [
@@ -418,3 +434,93 @@ def test_steps_blending(
     assert (
         precip_forecast.shape[1] == n_timesteps
     ), "Wrong amount of output time steps in converted forecast output"
+
+
+# --------------------------------------------------------------------------- #
+# Additional minimal tests for new precip_models inputs (Dask and cascade provider)
+
+
+def _build_synthetic_inputs(n_models=1, timesteps=2, m=8, n=8):
+    rng = np.random.default_rng(0)
+    radar_precip = rng.random((3, m, n)) + 0.1  # ensure non-zero rain
+    nwp_precip = rng.random((n_models, timesteps + 1, m, n)) + 0.1
+    velocity = np.zeros((2, m, n), dtype=float)
+    velocity_models = np.zeros((n_models, timesteps + 1, 2, m, n), dtype=float)
+    return radar_precip, nwp_precip, velocity, velocity_models
+
+
+def test_steps_dask_precip_models():
+    da = pytest.importorskip("dask.array")
+    radar_precip, nwp_precip, velocity, velocity_models = _build_synthetic_inputs()
+    precip_models = da.from_array(
+        nwp_precip,
+        chunks=(1, 1, nwp_precip.shape[-2], nwp_precip.shape[-1]),
+    )
+
+    forecast = blending.steps.forecast(
+        precip=radar_precip,
+        precip_models=precip_models,
+        velocity=velocity,
+        velocity_models=velocity_models,
+        timesteps=2,
+        timestep=1.0,
+        issuetime=datetime.datetime(2020, 1, 1, 0, 0),
+        n_ens_members=1,
+        precip_thr=0.1,
+        kmperpixel=1.0,
+        noise_stddev_adj=None,
+        vel_pert_method=None,
+        weights_method="bps",
+        n_cascade_levels=3,
+    )
+
+    assert forecast.shape == (1, 2, radar_precip.shape[-2], radar_precip.shape[-1])
+    assert np.isfinite(forecast).all()
+
+
+def test_steps_cascade_provider_precip_models():
+    radar_precip, nwp_precip, velocity, velocity_models = _build_synthetic_inputs()
+
+    filter_method = cascade.get_method("gaussian")
+    bandpass_filter = filter_method((radar_precip.shape[-2], radar_precip.shape[-1]), 3)
+    decomposition_method, _ = cascade.get_method("fft")
+    fft_method = utils.get_method("numpy", shape=radar_precip.shape[-2:])
+
+    cascade_cache = {}
+    for model_idx in range(nwp_precip.shape[0]):
+        for t_idx in range(nwp_precip.shape[1]):
+            cascade_cache[(model_idx, t_idx)] = decomposition_method(
+                field=nwp_precip[model_idx, t_idx],
+                bp_filter=bandpass_filter,
+                n_levels=3,
+                mask=None,
+                method="fft",
+                fft_method=fft_method,
+                output_domain="spatial",
+                compute_stats=True,
+                normalize=True,
+                compact_output=True,
+            )
+
+    def provider(model_idx, timestep):
+        return cascade_cache[(model_idx, timestep)]
+
+    forecast = blending.steps.forecast(
+        precip=radar_precip,
+        precip_models=provider,
+        velocity=velocity,
+        velocity_models=velocity_models,
+        timesteps=2,
+        timestep=1.0,
+        issuetime=datetime.datetime(2020, 1, 1, 0, 0),
+        n_ens_members=1,
+        precip_thr=0.1,
+        kmperpixel=1.0,
+        noise_stddev_adj=None,
+        vel_pert_method=None,
+        weights_method="bps",
+        n_cascade_levels=3,
+    )
+
+    assert forecast.shape == (1, 2, radar_precip.shape[-2], radar_precip.shape[-1])
+    assert np.isfinite(forecast).all()
